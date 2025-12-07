@@ -100,7 +100,5 @@ app.post("/", async (req, res) => {
 
 // ==================== START ====================
 app.listen(PORT, () => {
-  console.log(
-    `WhatsApp + OpenRouter bot LIVE at https://your-app.onrender.com`
-  );
+  console.log(`WhatsApp + OpenRouter bot LIVE on port ${PORT}`);
 });
