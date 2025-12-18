@@ -1,4 +1,4 @@
-// app.js — WhatsApp + OpenRouter AI Bot with RAG (Pinecone)
+// app.js — WhatsApp + OpenRouter AI Bot with RAG (Pinecone Integrated Inference)
 const express = require("express");
 const axios = require("axios");
 const { Pinecone } = require("@pinecone-database/pinecone");
@@ -14,7 +14,7 @@ const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_ID = process.env.PHONE_ID;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const PINECONE_INDEX = process.env.PINECONE_INDEX || "whatsapp-memory";
+const PINECONE_INDEX = process.env.PINECONE_INDEX || "whatsapp-memory-v2";
 
 // Validate required environment variables
 if (
@@ -32,30 +32,12 @@ if (
 const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
 const pineconeIndex = pinecone.Index(PINECONE_INDEX);
 
-// ==== HELPER: Get embeddings from OpenRouter ====
-async function getEmbedding(text) {
-  const response = await axios.post(
-    "https://openrouter.ai/api/v1/embeddings",
-    {
-      model: "qwen/qwen3-embedding-0.6b",
-      input: text,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_KEY}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-  return response.data.data[0].embedding;
-}
-
 // ==== HELPER: Get user's Pinecone namespace ====
 function getUserNamespace(phoneNumber) {
   return `user_${phoneNumber}`;
 }
 
-// ==== HELPER: Save message to Pinecone ====
+// ==== HELPER: Save message to Pinecone (integrated inference) ====
 async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
   try {
     const namespace = getUserNamespace(phoneNumber);
@@ -63,20 +45,14 @@ async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
       .toString(36)
       .substr(2, 9)}`;
 
-    // Get embedding from OpenRouter
-    const embedding = await getEmbedding(messageText);
-
-    // Upsert to Pinecone
-    await pineconeIndex.namespace(namespace).upsert([
+    // Use upsertRecords for integrated inference index - Pinecone auto-embeds
+    await pineconeIndex.namespace(namespace).upsertRecords([
       {
-        id: messageId,
-        values: embedding,
-        metadata: {
-          content: messageText,
-          role: role,
-          timestamp: new Date().toISOString(),
-          phoneNumber: phoneNumber,
-        },
+        _id: messageId,
+        content: messageText,
+        role: role,
+        timestamp: new Date().toISOString(),
+        phoneNumber: phoneNumber,
       },
     ]);
 
@@ -88,29 +64,24 @@ async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
   }
 }
 
-// ==== HELPER: Retrieve relevant context from Pinecone ====
+// ==== HELPER: Retrieve relevant context from Pinecone (integrated inference) ====
 async function retrieveContext(phoneNumber, queryText, topK = 6) {
   try {
     const namespace = getUserNamespace(phoneNumber);
 
-    // Get embedding for query
-    const queryEmbedding = await getEmbedding(queryText);
-
-    // Query Pinecone
-    const results = await pineconeIndex.namespace(namespace).query({
-      vector: queryEmbedding,
-      topK: topK,
-      includeMetadata: true,
+    // Use searchRecords for integrated inference index - Pinecone auto-embeds query
+    const results = await pineconeIndex.namespace(namespace).searchRecords({
+      query: { topK, inputs: { text: queryText } },
+      fields: ["content", "role", "timestamp"],
     });
 
-    if (!results.matches?.length) {
+    if (!results.result?.hits?.length) {
       return "";
     }
 
-    // Format retrieved messages for context
-    const contextMessages = results.matches.map((match) => {
-      const role = match.metadata?.role || "user";
-      const content = match.metadata?.content || "";
+    const contextMessages = results.result.hits.map((hit) => {
+      const role = hit.fields?.role || "user";
+      const content = hit.fields?.content || "";
       return `${role}: ${content}`;
     });
 
@@ -126,7 +97,7 @@ async function callOpenRouterLLM(systemPrompt, userMessage) {
   const response = await axios.post(
     "https://openrouter.ai/api/v1/chat/completions",
     {
-      model: "anthropic/claude-3.5-sonnet",
+      model: "kwaipilot/kat-coder-pro:free",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
