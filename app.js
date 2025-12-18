@@ -15,6 +15,9 @@ const PHONE_ID = process.env.PHONE_ID;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
 const PINECONE_INDEX = process.env.PINECONE_INDEX || "whatsapp-memory-v2";
+const PINECONE_HOST =
+  process.env.PINECONE_HOST ||
+  "whatsapp-memory-v2-b9h2kcy.svc.aped-4627-b74a.pinecone.io";
 
 // Validate required environment variables
 if (
@@ -30,7 +33,8 @@ if (
 
 // ==== INITIALIZE PINECONE ====
 const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
-const pineconeIndex = pinecone.Index(PINECONE_INDEX);
+// Use host directly for integrated inference index
+const pineconeIndex = pinecone.index(PINECONE_INDEX, PINECONE_HOST);
 
 // ==== HELPER: Get user's Pinecone namespace ====
 function getUserNamespace(phoneNumber) {
@@ -46,9 +50,10 @@ async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
       .substr(2, 9)}`;
 
     // Use upsertRecords for integrated inference index - Pinecone auto-embeds
+    // Use 'id' (not '_id') and 'content' field matches the index fieldMap
     await pineconeIndex.namespace(namespace).upsertRecords([
       {
-        _id: messageId,
+        id: messageId,
         content: messageText,
         role: role,
         timestamp: new Date().toISOString(),
