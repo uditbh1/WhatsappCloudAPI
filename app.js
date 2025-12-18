@@ -1,12 +1,7 @@
-// app.js — WhatsApp + OpenRouter AI Bot with RAG (Pinecone + LangChain)
+// app.js — WhatsApp + OpenRouter AI Bot with RAG (Pinecone)
 const express = require("express");
 const axios = require("axios");
-const { ChatOpenAI } = require("@langchain/openai");
-const { OpenAIEmbeddings } = require("@langchain/openai");
-const { PineconeStore } = require("@langchain/pinecone");
 const { Pinecone } = require("@pinecone-database/pinecone");
-const { Document } = require("@langchain/core/documents");
-const { HumanMessage, SystemMessage } = require("@langchain/core/messages");
 require("dotenv").config();
 
 const app = express();
@@ -19,7 +14,7 @@ const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_ID = process.env.PHONE_ID;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const PINECONE_INDEX = process.env.PINECONE_INDEX;
+const PINECONE_INDEX = process.env.PINECONE_INDEX || "whatsapp-memory";
 
 // Validate required environment variables
 if (
@@ -27,8 +22,7 @@ if (
   !WA_TOKEN ||
   !PHONE_ID ||
   !OPENROUTER_KEY ||
-  !PINECONE_API_KEY ||
-  !PINECONE_INDEX
+  !PINECONE_API_KEY
 ) {
   console.error("Missing required environment variables!");
   process.exit(1);
@@ -38,31 +32,23 @@ if (
 const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
 const pineconeIndex = pinecone.Index(PINECONE_INDEX);
 
-// ==== INITIALIZE EMBEDDINGS (OpenRouter) ====
-const embeddings = new OpenAIEmbeddings({
-  model: "nomic-ai/nomic-embed-text-v1.5",
-  apiKey: OPENROUTER_KEY,
-  configuration: {
-    baseURL: "https://openrouter.ai/api/v1",
-  },
-});
-
-// ==== INITIALIZE LLM (OpenRouter - Claude 3.5 Sonnet) ====
-const llm = new ChatOpenAI(
-  {
-    model: "anthropic/claude-3.5-sonnet",
-    temperature: 0.8,
-    maxTokens: 500,
-    apiKey: OPENROUTER_KEY,
-  },
-  {
-    baseURL: "https://openrouter.ai/api/v1",
-    defaultHeaders: {
-      "HTTP-Referer": "https://your-github-or-resume.com", // Optional
-      "X-Title": "WhatsApp AI Bot", // Optional
+// ==== HELPER: Get embeddings from OpenRouter ====
+async function getEmbedding(text) {
+  const response = await axios.post(
+    "https://openrouter.ai/api/v1/embeddings",
+    {
+      model: "qwen/qwen3-embedding-0.6b",
+      input: text,
     },
-  }
-);
+    {
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  return response.data.data[0].embedding;
+}
 
 // ==== HELPER: Get user's Pinecone namespace ====
 function getUserNamespace(phoneNumber) {
@@ -73,34 +59,31 @@ function getUserNamespace(phoneNumber) {
 async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
   try {
     const namespace = getUserNamespace(phoneNumber);
-    const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
-      pineconeIndex,
-      namespace,
-    });
-
-    // Create document with message text and metadata
-    const doc = new Document({
-      pageContent: messageText,
-      metadata: {
-        role,
-        timestamp: new Date().toISOString(),
-        phoneNumber,
-      },
-    });
-
-    // Generate unique ID for this message (timestamp-based)
     const messageId = `${role}_${Date.now()}_${Math.random()
       .toString(36)
       .substr(2, 9)}`;
 
-    // Add document to vector store
-    await vectorStore.addDocuments([doc], { ids: [messageId] });
+    // Get embedding from OpenRouter
+    const embedding = await getEmbedding(messageText);
+
+    // Upsert to Pinecone
+    await pineconeIndex.namespace(namespace).upsert([
+      {
+        id: messageId,
+        values: embedding,
+        metadata: {
+          content: messageText,
+          role: role,
+          timestamp: new Date().toISOString(),
+          phoneNumber: phoneNumber,
+        },
+      },
+    ]);
 
     console.log(`Saved ${role} message to Pinecone namespace: ${namespace}`);
     return messageId;
   } catch (error) {
     console.error(`Error saving message to Pinecone:`, error.message);
-    // Don't throw - allow conversation to continue even if save fails
     return null;
   }
 }
@@ -109,26 +92,59 @@ async function saveMessageToPinecone(phoneNumber, messageText, role = "user") {
 async function retrieveContext(phoneNumber, queryText, topK = 6) {
   try {
     const namespace = getUserNamespace(phoneNumber);
-    const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
-      pineconeIndex,
-      namespace,
+
+    // Get embedding for query
+    const queryEmbedding = await getEmbedding(queryText);
+
+    // Query Pinecone
+    const results = await pineconeIndex.namespace(namespace).query({
+      vector: queryEmbedding,
+      topK: topK,
+      includeMetadata: true,
     });
 
-    // Retrieve top K most relevant messages
-    const results = await vectorStore.similaritySearch(queryText, topK);
+    if (!results.matches?.length) {
+      return "";
+    }
 
     // Format retrieved messages for context
-    const contextMessages = results.map((doc) => {
-      const role = doc.metadata?.role || "user";
-      return `${role}: ${doc.pageContent}`;
+    const contextMessages = results.matches.map((match) => {
+      const role = match.metadata?.role || "user";
+      const content = match.metadata?.content || "";
+      return `${role}: ${content}`;
     });
 
     return contextMessages.join("\n");
   } catch (error) {
     console.error(`Error retrieving context from Pinecone:`, error.message);
-    // Return empty context if retrieval fails
     return "";
   }
+}
+
+// ==== HELPER: Call OpenRouter LLM ====
+async function callOpenRouterLLM(systemPrompt, userMessage) {
+  const response = await axios.post(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      model: "anthropic/claude-3.5-sonnet",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      max_tokens: 500,
+      temperature: 0.8,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://whatsapp-bot.app",
+        "X-Title": "WhatsApp AI Bot",
+      },
+    }
+  );
+
+  return response.data.choices[0].message.content.trim();
 }
 
 // ==================== WEBHOOK VERIFICATION ====================
@@ -170,14 +186,8 @@ ${
     : "This is a new conversation."
 }`;
 
-    // Step 4: Generate reply using LLM with context
-    const messages = [
-      new SystemMessage(systemPrompt),
-      new HumanMessage(userText),
-    ];
-
-    const response = await llm.invoke(messages);
-    const aiReply = response.content.trim();
+    // Step 4: Generate reply using OpenRouter LLM
+    const aiReply = await callOpenRouterLLM(systemPrompt, userText);
 
     // Step 5: Save assistant reply to Pinecone
     await saveMessageToPinecone(from, aiReply, "assistant");
