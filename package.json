@@ -1,5 +1,9 @@
 {
   "dependencies": {
+    "@langchain/core": "^1.1.6",
+    "@langchain/openai": "^1.2.0",
+    "@langchain/pinecone": "^1.0.1",
+    "@pinecone-database/pinecone": "^5.1.2",
     "axios": "^1.13.2",
     "dotenv": "^17.2.3",
     "express": "^5.2.1"
